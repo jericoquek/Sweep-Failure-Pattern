@@ -1,0 +1,1503 @@
+//@version=6
+indicator("Swing Failure Pattern", overlay=true, precision=2, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// =================================================================================================
+// Swing Failure Pattern
+// Fresh implementation of the project's anchored structural-liquidity / MSS / MMXM specification.
+//
+// Model:
+// Structural liquidity extreme → SFP → Short-Term MSS → Intermediate-Term MSS → MMXM program state
+//
+// 15m Anchor edition — based directly on the v5 Extreme Only engine.
+//
+// Timeframe model:
+// • 15m is the sole analysis timeframe for SFP, ST MSS, IT MSS and MMXM state.
+// • On a 15m chart the engine runs directly, with no request.security() layer.
+// • On lower charts (1m / 3m / 5m etc.), only confirmed closed 15m state is projected.
+// • Charts above 15m are unsupported and anchored drawings/alerts are suppressed.
+//
+// Extreme-only trend rule:
+// • In a confirmed BUY program, bullish SFPs at higher lows are internal continuation and are rejected.
+//   A new bullish SFP is eligible only if its raid makes a lower extreme than the BUY program origin.
+// • In a confirmed SELL program, bearish SFPs at lower highs are internal continuation and are rejected.
+//   A new bearish SFP is eligible only if its raid makes a higher extreme than the SELL program origin.
+// • Opposite-direction SFPs remain eligible as reversal candidates and are invalidated if trend continues.
+//
+// Detection logic and current 720 / 960-minute controls are unchanged from v5.
+// =================================================================================================
+
+// -------------------------------------------------------------------------------------------------
+// Fixed analysis timeframe
+// -------------------------------------------------------------------------------------------------
+string SFP_TF = "15"
+float SFP_TF_SEC = 900.0
+int SFP_BAR_MS = 900000
+
+chartSec = timeframe.in_seconds()
+chartAbove15m = chartSec > SFP_TF_SEC
+chartEquals15m = chartSec == SFP_TF_SEC
+chartBelow15m = chartSec < SFP_TF_SEC
+
+// -------------------------------------------------------------------------------------------------
+// Structure / MMXM
+// -------------------------------------------------------------------------------------------------
+G_STRUCT = "Structure / MMXM"
+cmeOnly = input.bool(false, "CME hours only", group=G_STRUCT,
+     tooltip="For 24/7 symbols traded on CME session timing, such as a NAS100 perpetual. The 15m engine reads CME-hours bars only, as if weekend and 17:00-18:00 break bars did not exist: they register no level, sweep nothing, print no SFP or MSS, flip no program and are not counted by any timer. State holds through closed hours. Off, the indicator runs on every bar. Clock-based, so CME holidays are not detected.")
+
+sfpStrength = input.int(3, "SFP swing strength (bars)", minval=1, maxval=20, group=G_STRUCT,
+     tooltip="Left-side dominance on the 15m analysis timeframe. One right 15m bar confirms the swing.")
+
+equalTicks = input.int(4, "Equal-level tolerance (ticks)", minval=0, maxval=40, group=G_STRUCT,
+     tooltip="Near-equal structural highs/lows are merged. The more extreme level is retained.")
+
+maxLevels = input.int(100, "Liquidity levels tracked per side", minval=5, maxval=100, group=G_STRUCT,
+     tooltip="When the register is full, the least-extreme standing level is discarded so outer liquidity survives.")
+
+showMMXM = input.bool(false, "Show MMXM state", group=G_STRUCT)
+
+statePositionChoice = input.string("Top Center", "MMXM state position",
+     options=["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"],
+     group=G_STRUCT)
+
+showExtremes = input.bool(false, "Show active liquidity extremes", group=G_STRUCT,
+     tooltip="Diagnostic only. Shows the outermost standing structural high and low retained by the 15m analysis engine.")
+
+// -------------------------------------------------------------------------------------------------
+// Detection
+// -------------------------------------------------------------------------------------------------
+G_DETECT = "Detection"
+
+maxRaidMinutes = input.float(90, "Max raid time (minutes)", minval=1, group=G_DETECT)
+minDepthATR     = input.float(0.0, "Min sweep depth (ATR)", minval=0, step=0.1, group=G_DETECT)
+minAgeMinutes   = input.float(10, "Min level age (minutes)", minval=0, group=G_DETECT)
+
+nextCandleConfirm = input.bool(true, "Next-candle confirmation", group=G_DETECT,
+     tooltip="When enabled, the reclaim must occur after the final raid-extreme 15m candle.")
+
+minReclaimBodyATR = input.float(0.2, "Min reclaim body (ATR)", minval=0, step=0.05, group=G_DETECT,
+     tooltip="Directional reclaim-body requirement. Set to 0 to disable.")
+
+maxTransitionMinutes = input.float(720, "Max MMXM transition time (minutes)", minval=0, group=G_DETECT,
+     tooltip="15m model timeout from SFP reclaim to Intermediate-Term MSS. 720 minutes = 48 x 15m bars. Set to 0 for no expiry.")
+minProgramMinutes = input.float(960, "Min program age before reversal (minutes)", minval=0, group=G_DETECT,
+     tooltip="15m model maturity guard before an opposing reversal SFP can form. 960 minutes = 64 x 15m bars. Tested stable from 13h to 21h on the 15m model. 0 disables.")
+
+enableBull = input.bool(true, "Bullish SFP", group=G_DETECT)
+enableBear = input.bool(true, "Bearish SFP", group=G_DETECT)
+
+// -------------------------------------------------------------------------------------------------
+// Style
+// -------------------------------------------------------------------------------------------------
+G_STYLE = "Style"
+
+showLiquidityLine = input.bool(true, "SFP liquidity line", group=G_STYLE)
+showSweepWick     = input.bool(true, "Sweep wick", group=G_STYLE)
+showSFPLabel      = input.bool(true, "SFP label", group=G_STYLE)
+showSTMSS         = input.bool(true, "Short-Term MSS", group=G_STYLE)
+showITMSS         = input.bool(true, "Intermediate-Term MSS", group=G_STYLE)
+showSweepZone     = input.bool(false, "Sweep zone box", group=G_STYLE)
+
+zoneMinBars = input.int(8, "Sweep zone minimum width (15m bars)", minval=1, maxval=100, group=G_STYLE,
+     tooltip="Minimum visual width of a developing or confirmed sweep zone, measured in 15m bars. "
+           + "Invalidated zones stop at the actual invalidation time.")
+
+fadeDeveloping = input.bool(true, "Fade developing setups", group=G_STYLE)
+
+removeInvalidated = input.bool(false, "Remove invalidated setups", group=G_STYLE,
+     tooltip="OFF preserves failed setups that reached ST MSS as muted historical evidence. "
+           + "Plain SFPs that never reached ST MSS are removed when invalidated.")
+
+historyLimit = input.int(50, "Historical setups", minval=1, maxval=120, group=G_STYLE)
+
+bullColor     = input.color(#2962FF, "Bullish", inline="c", group=G_STYLE)
+bearColor     = input.color(#F23645, "Bearish", inline="c", group=G_STYLE)
+bullWickColor = input.color(#2962FF80, "Bullish wick", inline="w", group=G_STYLE)
+bearWickColor = input.color(#F2364580, "Bearish wick", inline="w", group=G_STYLE)
+
+// -------------------------------------------------------------------------------------------------
+// Drawing state
+// -------------------------------------------------------------------------------------------------
+type VisualSetup
+    int direction
+    int swingTime
+    float swingPrice
+    int wickTime
+    float wickPrice
+    int fireTime
+    float stPrice
+    int stOriginTime
+    float itPrice
+    int itOriginTime
+    bool active
+    bool stReached
+    bool confirmed
+    line liquidityLine
+    line wickLine
+    line stLine
+    line itLine
+    label sfpLabel
+    label stLabel
+    label itLabel
+    box sweepBox
+
+transparent = color(na)
+
+zoneMinRight(int wickTime) =>
+    wickTime + zoneMinBars * SFP_BAR_MS
+
+// -------------------------------------------------------------------------------------------------
+// Register helpers
+// -------------------------------------------------------------------------------------------------
+registerHigh(array<float> prices, array<int> bars, array<int> times, array<float> protectedLows,
+             float price, int bx, int tm, float protectedLow, float tolerance, int capacity) =>
+    int merge = na
+
+    if array.size(prices) > 0
+        for i = 0 to array.size(prices) - 1
+            if math.abs(price - array.get(prices, i)) <= tolerance
+                merge := i
+                break
+
+    if na(merge)
+        array.push(prices, price)
+        array.push(bars, bx)
+        array.push(times, tm)
+        array.push(protectedLows, protectedLow)
+    else if price >= array.get(prices, merge)
+        array.set(prices, merge, price)
+        array.set(bars, merge, bx)
+        array.set(times, merge, tm)
+        array.set(protectedLows, merge, protectedLow)
+
+    // Evict the OLDEST level. Evicting the least extreme level instead always discards the
+    // newest, nearest-price level, so on deep history the register saturates with ancient
+    // extremes and nothing near price can ever be swept.
+    while array.size(prices) > capacity
+        int dropIndex = 0
+        int oldestBar = array.get(bars, 0)
+
+        if array.size(prices) > 1
+            for i = 1 to array.size(prices) - 1
+                if array.get(bars, i) < oldestBar
+                    oldestBar := array.get(bars, i)
+                    dropIndex := i
+
+        array.remove(prices, dropIndex)
+        array.remove(bars, dropIndex)
+        array.remove(times, dropIndex)
+        array.remove(protectedLows, dropIndex)
+
+registerLow(array<float> prices, array<int> bars, array<int> times, array<float> protectedHighs,
+            float price, int bx, int tm, float protectedHigh, float tolerance, int capacity) =>
+    int merge = na
+
+    if array.size(prices) > 0
+        for i = 0 to array.size(prices) - 1
+            if math.abs(price - array.get(prices, i)) <= tolerance
+                merge := i
+                break
+
+    if na(merge)
+        array.push(prices, price)
+        array.push(bars, bx)
+        array.push(times, tm)
+        array.push(protectedHighs, protectedHigh)
+    else if price <= array.get(prices, merge)
+        array.set(prices, merge, price)
+        array.set(bars, merge, bx)
+        array.set(times, merge, tm)
+        array.set(protectedHighs, merge, protectedHigh)
+
+    // Evict the OLDEST level - see registerHigh.
+    while array.size(prices) > capacity
+        int dropIndex = 0
+        int oldestBar = array.get(bars, 0)
+
+        if array.size(prices) > 1
+            for i = 1 to array.size(prices) - 1
+                if array.get(bars, i) < oldestBar
+                    oldestBar := array.get(bars, i)
+                    dropIndex := i
+
+        array.remove(prices, dropIndex)
+        array.remove(bars, dropIndex)
+        array.remove(times, dropIndex)
+        array.remove(protectedHighs, dropIndex)
+
+consumeHighs(array<float> prices, array<int> bars, array<int> times, array<float> protectedLows, float raidHigh) =>
+    if array.size(prices) > 0
+        for i = array.size(prices) - 1 to 0
+            if array.get(prices, i) <= raidHigh
+                array.remove(prices, i)
+                array.remove(bars, i)
+                array.remove(times, i)
+                array.remove(protectedLows, i)
+
+consumeLows(array<float> prices, array<int> bars, array<int> times, array<float> protectedHighs, float raidLow) =>
+    if array.size(prices) > 0
+        for i = array.size(prices) - 1 to 0
+            if array.get(prices, i) >= raidLow
+                array.remove(prices, i)
+                array.remove(bars, i)
+                array.remove(times, i)
+                array.remove(protectedHighs, i)
+
+outerHigh(array<float> prices, array<int> times) =>
+    float px = na
+    int tm = na
+
+    if array.size(prices) > 0
+        px := array.get(prices, 0)
+        tm := array.get(times, 0)
+
+        if array.size(prices) > 1
+            for i = 1 to array.size(prices) - 1
+                if array.get(prices, i) > px
+                    px := array.get(prices, i)
+                    tm := array.get(times, i)
+
+    [px, tm]
+
+outerLow(array<float> prices, array<int> times) =>
+    float px = na
+    int tm = na
+
+    if array.size(prices) > 0
+        px := array.get(prices, 0)
+        tm := array.get(times, 0)
+
+        if array.size(prices) > 1
+            for i = 1 to array.size(prices) - 1
+                if array.get(prices, i) < px
+                    px := array.get(prices, i)
+                    tm := array.get(times, i)
+
+    [px, tm]
+
+// -------------------------------------------------------------------------------------------------
+// Swing helpers
+// -------------------------------------------------------------------------------------------------
+// True on a bar CME_MINI:MNQ1! would also have. 18:00 New York shifted +6h lands on 00:00 of
+// the CME trade date, so Sunday 18:00 belongs to Monday and Friday after 17:00 to Saturday.
+f_cmeClock(int t) =>
+    string tz = "America/New_York"
+    int tdDow = dayofweek(t + 6 * 60 * 60 * 1000, tz)
+    bool wkday = tdDow >= dayofweek.monday and tdDow <= dayofweek.friday
+    wkday and hour(t, tz) != 17
+
+// The swing helpers read the series passed in, never the chart's built-ins, so inside the
+// conditionally called engine [n] is the n-th previous OPEN bar.
+liquiditySwingHigh(float hi, int strength) =>
+    bool valid = hi[1] > hi
+
+    for i = 1 to strength
+        if hi[1] < hi[1 + i]
+            valid := false
+            break
+
+    valid
+
+liquiditySwingLow(float lo, int strength) =>
+    bool valid = lo[1] < lo
+
+    for i = 1 to strength
+        if lo[1] > lo[1 + i]
+            valid := false
+            break
+
+    valid
+
+shortSwingHigh(float hi, int idx) =>
+    idx >= 2 and hi[2] < hi[1] and hi[1] >= hi
+
+shortSwingLow(float lo, int idx) =>
+    idx >= 2 and lo[2] > lo[1] and lo[1] <= lo
+
+// -------------------------------------------------------------------------------------------------
+// Anchor engine
+// -------------------------------------------------------------------------------------------------
+anchorEngine(float bOpen, float bHigh, float bLow, float bClose, int bTime) =>
+    // Counts the bars the engine actually runs on. Equals bar_index when every bar is open.
+    var int bIdx = -1
+    bIdx += 1
+
+    float anchorSeconds = timeframe.in_seconds()
+
+    // True range from the passed-in bars, so in CME-hours mode the previous close is the previous
+    // OPEN bar's close. With the box off the engine keeps ta.atr exactly as before.
+    float trOpen = na(bClose[1]) ? bHigh - bLow : math.max(bHigh - bLow, math.abs(bHigh - bClose[1]), math.abs(bLow - bClose[1]))
+    float atrBuiltin = ta.atr(14)
+    float atrRebuilt = ta.rma(trOpen, 14)
+    float atr = cmeOnly ? atrRebuilt : atrBuiltin
+
+    int minAgeBars = minAgeMinutes == 0 ? 0 : math.max(1, int(math.ceil(minAgeMinutes * 60.0 / anchorSeconds)))
+    int raidBars = math.max(1, int(math.ceil(maxRaidMinutes * 60.0 / anchorSeconds)))
+    int transitionBars = maxTransitionMinutes == 0 ? 0 : math.max(1, int(math.ceil(maxTransitionMinutes * 60.0 / anchorSeconds)))
+    int minProgramBars = minProgramMinutes == 0 ? 0 : math.max(1, int(math.ceil(minProgramMinutes * 60.0 / anchorSeconds)))
+
+    float equalityTolerance = equalTicks * syminfo.mintick
+
+    bool bearishBodyOK = minReclaimBodyATR == 0 or na(atr) or
+         (bClose < bOpen and (bOpen - bClose) >= minReclaimBodyATR * atr)
+
+    bool bullishBodyOK = minReclaimBodyATR == 0 or na(atr) or
+         (bClose > bOpen and (bClose - bOpen) >= minReclaimBodyATR * atr)
+
+    // ---------------------------------------------------------------------------------------------
+    // Short-Term and Intermediate-Term structure
+    // ---------------------------------------------------------------------------------------------
+    var float stHigh = na
+    var int stHighTime = na
+    var float stLow = na
+    var int stLowTime = na
+
+    var float h1 = na
+    var float h2 = na
+    var float h3 = na
+    var int h1Time = na
+    var int h2Time = na
+    var int h3Time = na
+
+    var float l1 = na
+    var float l2 = na
+    var float l3 = na
+    var int l1Time = na
+    var int l2Time = na
+    var int l3Time = na
+
+    var float itHigh = na
+    var int itHighTime = na
+    var float itLow = na
+    var int itLowTime = na
+
+    if shortSwingHigh(bHigh, bIdx)
+        float candidate = bHigh[1]
+        int candidateTime = bTime[1]
+
+        stHigh := candidate
+        stHighTime := candidateTime
+
+        h1 := h2
+        h1Time := h2Time
+        h2 := h3
+        h2Time := h3Time
+        h3 := candidate
+        h3Time := candidateTime
+
+        if not na(h1) and not na(h2) and not na(h3) and h1 < h2 and h2 >= h3
+            itHigh := h2
+            itHighTime := h2Time
+
+    if shortSwingLow(bLow, bIdx)
+        float candidate = bLow[1]
+        int candidateTime = bTime[1]
+
+        stLow := candidate
+        stLowTime := candidateTime
+
+        l1 := l2
+        l1Time := l2Time
+        l2 := l3
+        l2Time := l3Time
+        l3 := candidate
+        l3Time := candidateTime
+
+        if not na(l1) and not na(l2) and not na(l3) and l1 > l2 and l2 <= l3
+            itLow := l2
+            itLowTime := l2Time
+
+    // ---------------------------------------------------------------------------------------------
+    // Standing structural liquidity
+    // ---------------------------------------------------------------------------------------------
+    var array<float> highPrices = array.new_float()
+    var array<int> highBars = array.new_int()
+    var array<int> highTimes = array.new_int()
+    var array<float> highProtectedLows = array.new_float()
+
+    var array<float> lowPrices = array.new_float()
+    var array<int> lowBars = array.new_int()
+    var array<int> lowTimes = array.new_int()
+    var array<float> lowProtectedHighs = array.new_float()
+
+    var float lastLiquidityHigh = na
+    var float lastLiquidityLow = na
+
+    bool newLiquidityHigh = liquiditySwingHigh(bHigh, sfpStrength)
+    bool newLiquidityLow = liquiditySwingLow(bLow, sfpStrength)
+
+    // ---------------------------------------------------------------------------------------------
+    // MMXM program state
+    //  0 = unknown, +1 = BUY, -1 = SELL
+    // ---------------------------------------------------------------------------------------------
+    var int program = 0
+    var int programStartBar = na
+
+    // Extreme that established the current confirmed program.
+    // BUY  → terminal bullish SFP low.
+    // SELL → terminal bearish SFP high.
+    var float programOriginLow = na
+    var float programOriginHigh = na
+
+    // Running extremes of the CURRENT program. A reversal SFP must make a new extreme for the
+    // program it reverses. A sweep that stays inside the program's range is an internal sweep
+    // of a secondary level while the true extreme still stands - not a terminal failure.
+    var float programLow = na
+    var float programHigh = na
+    float programLowPrev = programLow
+    float programHighPrev = programHigh
+
+    // ---------------------------------------------------------------------------------------------
+    // Bearish raid state
+    // ---------------------------------------------------------------------------------------------
+    var bool bearRaid = false
+    var float bearLevel = na
+    var int bearLevelBar = na
+    var int bearLevelTime = na
+    var float bearExtreme = na
+    var int bearExtremeBar = na
+    var int bearExtremeTime = na
+    var int bearRaidStart = na
+
+    // ---------------------------------------------------------------------------------------------
+    // Bullish raid state
+    // ---------------------------------------------------------------------------------------------
+    var bool bullRaid = false
+    var float bullLevel = na
+    var int bullLevelBar = na
+    var int bullLevelTime = na
+    var float bullExtreme = na
+    var int bullExtremeBar = na
+    var int bullExtremeTime = na
+    var int bullRaidStart = na
+
+    // ---------------------------------------------------------------------------------------------
+    // Developing bearish SFP → MSS transition
+    // ---------------------------------------------------------------------------------------------
+    var bool bearSetupActive = false
+    var bool bearSTReached = false
+    var bool bearConfirmed = false
+    var float bearSetupSwing = na
+    var int bearSetupSwingTime = na
+    var float bearSetupWick = na
+    var int bearSetupWickTime = na
+    var int bearSetupFireBar = na
+    var int bearSetupFireTime = na
+    var float bearSetupST = na
+    var int bearSetupSTTime = na
+    var float bearSetupIT = na
+    var int bearSetupITTime = na
+
+    // ---------------------------------------------------------------------------------------------
+    // Developing bullish SFP → MSS transition
+    // ---------------------------------------------------------------------------------------------
+    var bool bullSetupActive = false
+    var bool bullSTReached = false
+    var bool bullConfirmed = false
+    var float bullSetupSwing = na
+    var int bullSetupSwingTime = na
+    var float bullSetupWick = na
+    var int bullSetupWickTime = na
+    var int bullSetupFireBar = na
+    var int bullSetupFireTime = na
+    var float bullSetupST = na
+    var int bullSetupSTTime = na
+    var float bullSetupIT = na
+    var int bullSetupITTime = na
+
+    // ---------------------------------------------------------------------------------------------
+    // Persistent event transport
+    //
+    // Do not return one-bar boolean pulses through request.security(). They can be swallowed by
+    // bar merging even while persistent MMXM state updates correctly. Instead, retain the latest
+    // event timestamp + payload and let the chart detect a timestamp change.
+    // ---------------------------------------------------------------------------------------------
+    var float lastBullEventSwing = na
+    var int lastBullEventSwingTime = na
+    var float lastBullEventWick = na
+    var int lastBullEventWickTime = na
+    var int lastBullSFPTime = na
+    var float lastBullEventST = na
+    var int lastBullEventSTOriginTime = na
+    var float lastBullEventIT = na
+    var int lastBullEventITOriginTime = na
+
+    var float lastBearEventSwing = na
+    var int lastBearEventSwingTime = na
+    var float lastBearEventWick = na
+    var int lastBearEventWickTime = na
+    var int lastBearSFPTime = na
+    var float lastBearEventST = na
+    var int lastBearEventSTOriginTime = na
+    var float lastBearEventIT = na
+    var int lastBearEventITOriginTime = na
+
+    var int lastBullSTEventTime = na
+    var int lastBearSTEventTime = na
+    var int lastBullITEventTime = na
+    var int lastBearITEventTime = na
+    var int lastBullInvalidEventTime = na
+    var int lastBearInvalidEventTime = na
+
+    // ---------------------------------------------------------------------------------------------
+    // Invalidation / expiry
+    // ---------------------------------------------------------------------------------------------
+    if bearSetupActive and not bearConfirmed
+        bool expired = transitionBars > 0 and bIdx - bearSetupFireBar > transitionBars
+
+        if bClose > bearSetupWick or expired
+            bearSetupActive := false
+            lastBearInvalidEventTime := bTime
+
+    if bullSetupActive and not bullConfirmed
+        bool expired = transitionBars > 0 and bIdx - bullSetupFireBar > transitionBars
+
+        if bClose < bullSetupWick or expired
+            bullSetupActive := false
+            lastBullInvalidEventTime := bTime
+
+    // ---------------------------------------------------------------------------------------------
+    // Bearish SFP
+    // ---------------------------------------------------------------------------------------------
+    bool bearishAllowed = enableBear and not (bearSetupActive and not bearConfirmed)
+
+    if bearishAllowed
+        if bearRaid and bHigh > bearExtreme
+            bearExtreme := bHigh
+            bearExtremeBar := bIdx
+            bearExtremeTime := bTime
+
+        float scanHigh = bearRaid ? bearExtreme : bHigh
+
+        // During an existing SELL program, a lower-high bearish SFP is internal trend structure.
+        // Only a new higher extreme may start another bearish SFP.
+        bool bearishExtremeOK = program != -1 or na(programOriginHigh) or scanHigh > programOriginHigh
+
+        float selectedHigh = na
+        int selectedHighBar = na
+        int selectedHighTime = na
+
+        // Every bearish SFP must make a new high for the current program - reversal or not.
+        // A sweep that stays inside the program's range is an internal sweep of a secondary high.
+        bool bearishNewExtreme = bearRaid or na(programHighPrev) or bHigh > programHighPrev
+        // A reversal against a young BUY program is its first pullback, not its terminal.
+        bool bearishMature = program != 1 or bearRaid or minProgramBars == 0 or na(programStartBar) or
+             bIdx - programStartBar >= minProgramBars
+
+        if bearishExtremeOK and bearishNewExtreme and bearishMature and array.size(highPrices) > 0
+            for i = 0 to array.size(highPrices) - 1
+                float level = array.get(highPrices, i)
+                int levelBar = array.get(highBars, i)
+                int levelTime = array.get(highTimes, i)
+                float protectedLow = array.get(highProtectedLows, i)
+
+                bool ageOK = minAgeBars == 0 or bIdx - levelBar >= minAgeBars
+
+                if scanHigh > level and ageOK and not na(protectedLow) and
+                     (na(selectedHigh) or level > selectedHigh)
+                    selectedHigh := level
+                    selectedHighBar := levelBar
+                    selectedHighTime := levelTime
+
+        if not na(selectedHigh)
+            if not bearRaid
+                bearRaid := true
+                bearLevel := selectedHigh
+                bearLevelBar := selectedHighBar
+                bearLevelTime := selectedHighTime
+                bearExtreme := bHigh
+                bearExtremeBar := bIdx
+                bearExtremeTime := bTime
+                bearRaidStart := bIdx
+            else if selectedHigh > bearLevel
+                bearLevel := selectedHigh
+                bearLevelBar := selectedHighBar
+                bearLevelTime := selectedHighTime
+
+        if bearRaid
+            bool reclaimEligible = not nextCandleConfirm or bIdx > bearExtremeBar
+
+            if bClose < bearLevel and reclaimEligible
+                bool depthOK = minDepthATR == 0 or na(atr) or
+                     (bearExtreme - bearLevel) >= minDepthATR * atr
+
+                if depthOK and bearishBodyOK
+                    consumeHighs(highPrices, highBars, highTimes, highProtectedLows, bearExtreme)
+
+                    bearRaid := false
+                    bearSetupActive := true
+                    bearSTReached := false
+                    bearConfirmed := false
+
+                    bearSetupSwing := bearLevel
+                    bearSetupSwingTime := bearLevelTime
+                    bearSetupWick := bearExtreme
+                    bearSetupWickTime := bearExtremeTime
+                    bearSetupFireBar := bIdx
+                    bearSetupFireTime := bTime
+                    bearSetupST := stLow
+                    bearSetupSTTime := stLowTime
+                    bearSetupIT := itLow
+                    bearSetupITTime := itLowTime
+
+                    lastBearEventSwing := bearSetupSwing
+                    lastBearEventSwingTime := bearSetupSwingTime
+                    lastBearEventWick := bearSetupWick
+                    lastBearEventWickTime := bearSetupWickTime
+                    lastBearSFPTime := bearSetupFireTime
+                    lastBearEventST := bearSetupST
+                    lastBearEventSTOriginTime := bearSetupSTTime
+                    lastBearEventIT := bearSetupIT
+                    lastBearEventITOriginTime := bearSetupITTime
+
+            if bearRaid and bClose > bearLevel and reclaimEligible
+                consumeHighs(highPrices, highBars, highTimes, highProtectedLows, bearExtreme)
+                bearRaid := false
+
+            if bearRaid and bIdx - bearRaidStart >= raidBars
+                bearRaid := false
+
+    // ---------------------------------------------------------------------------------------------
+    // Bullish SFP
+    // ---------------------------------------------------------------------------------------------
+    bool bullishAllowed = enableBull and not (bullSetupActive and not bullConfirmed)
+
+    if bullishAllowed
+        if bullRaid and bLow < bullExtreme
+            bullExtreme := bLow
+            bullExtremeBar := bIdx
+            bullExtremeTime := bTime
+
+        float scanLow = bullRaid ? bullExtreme : bLow
+
+        // During an existing BUY program, a higher-low bullish SFP is internal trend structure.
+        // Only a new lower extreme may start another bullish SFP.
+        bool bullishExtremeOK = program != 1 or na(programOriginLow) or scanLow < programOriginLow
+
+        float selectedLow = na
+        int selectedLowBar = na
+        int selectedLowTime = na
+
+        // Every bullish SFP must make a new low for the current program - reversal or not.
+        bool bullishNewExtreme = bullRaid or na(programLowPrev) or bLow < programLowPrev
+        // A reversal against a young SELL program is its first pullback, not its terminal.
+        bool bullishMature = program != -1 or bullRaid or minProgramBars == 0 or na(programStartBar) or
+             bIdx - programStartBar >= minProgramBars
+
+        if bullishExtremeOK and bullishNewExtreme and bullishMature and array.size(lowPrices) > 0
+            for i = 0 to array.size(lowPrices) - 1
+                float level = array.get(lowPrices, i)
+                int levelBar = array.get(lowBars, i)
+                int levelTime = array.get(lowTimes, i)
+                float protectedHigh = array.get(lowProtectedHighs, i)
+
+                bool ageOK = minAgeBars == 0 or bIdx - levelBar >= minAgeBars
+
+                if scanLow < level and ageOK and not na(protectedHigh) and
+                     (na(selectedLow) or level < selectedLow)
+                    selectedLow := level
+                    selectedLowBar := levelBar
+                    selectedLowTime := levelTime
+
+        if not na(selectedLow)
+            if not bullRaid
+                bullRaid := true
+                bullLevel := selectedLow
+                bullLevelBar := selectedLowBar
+                bullLevelTime := selectedLowTime
+                bullExtreme := bLow
+                bullExtremeBar := bIdx
+                bullExtremeTime := bTime
+                bullRaidStart := bIdx
+            else if selectedLow < bullLevel
+                bullLevel := selectedLow
+                bullLevelBar := selectedLowBar
+                bullLevelTime := selectedLowTime
+
+        if bullRaid
+            bool reclaimEligible = not nextCandleConfirm or bIdx > bullExtremeBar
+
+            if bClose > bullLevel and reclaimEligible
+                bool depthOK = minDepthATR == 0 or na(atr) or
+                     (bullLevel - bullExtreme) >= minDepthATR * atr
+
+                if depthOK and bullishBodyOK
+                    consumeLows(lowPrices, lowBars, lowTimes, lowProtectedHighs, bullExtreme)
+
+                    bullRaid := false
+                    bullSetupActive := true
+                    bullSTReached := false
+                    bullConfirmed := false
+
+                    bullSetupSwing := bullLevel
+                    bullSetupSwingTime := bullLevelTime
+                    bullSetupWick := bullExtreme
+                    bullSetupWickTime := bullExtremeTime
+                    bullSetupFireBar := bIdx
+                    bullSetupFireTime := bTime
+                    bullSetupST := stHigh
+                    bullSetupSTTime := stHighTime
+                    bullSetupIT := itHigh
+                    bullSetupITTime := itHighTime
+
+                    lastBullEventSwing := bullSetupSwing
+                    lastBullEventSwingTime := bullSetupSwingTime
+                    lastBullEventWick := bullSetupWick
+                    lastBullEventWickTime := bullSetupWickTime
+                    lastBullSFPTime := bullSetupFireTime
+                    lastBullEventST := bullSetupST
+                    lastBullEventSTOriginTime := bullSetupSTTime
+                    lastBullEventIT := bullSetupIT
+                    lastBullEventITOriginTime := bullSetupITTime
+
+            if bullRaid and bClose < bullLevel and reclaimEligible
+                consumeLows(lowPrices, lowBars, lowTimes, lowProtectedHighs, bullExtreme)
+                bullRaid := false
+
+            if bullRaid and bIdx - bullRaidStart >= raidBars
+                bullRaid := false
+
+    // ---------------------------------------------------------------------------------------------
+    // Post-SFP MSS hierarchy
+    // ---------------------------------------------------------------------------------------------
+    if bearSetupActive and not bearConfirmed
+        if not bearSTReached and not na(bearSetupST) and bClose < bearSetupST
+            bearSTReached := true
+            lastBearSTEventTime := bTime
+
+        if bearSTReached and not na(bearSetupIT) and bClose < bearSetupIT
+            bearConfirmed := true
+            bearSetupActive := false
+            lastBearITEventTime := bTime
+            program := -1
+            programOriginHigh := bearSetupWick
+            programOriginLow := na
+            programLow := na
+            programHigh := na
+            programStartBar := bIdx
+
+            bearRaid := false
+            bullRaid := false
+
+            // Do not erase standing lows when SELL confirms.
+            // A later terminal bullish reversal may need to sweep older external liquidity.
+
+            if bullSetupActive and not bullConfirmed
+                bullSetupActive := false
+                lastBullInvalidEventTime := bTime
+
+    if bullSetupActive and not bullConfirmed
+        if not bullSTReached and not na(bullSetupST) and bClose > bullSetupST
+            bullSTReached := true
+            lastBullSTEventTime := bTime
+
+        if bullSTReached and not na(bullSetupIT) and bClose > bullSetupIT
+            bullConfirmed := true
+            bullSetupActive := false
+            lastBullITEventTime := bTime
+            program := 1
+            programOriginLow := bullSetupWick
+            programOriginHigh := na
+            programLow := na
+            programHigh := na
+            programStartBar := bIdx
+
+            bearRaid := false
+            bullRaid := false
+
+            // Do not erase standing highs when BUY confirms.
+            // A later terminal bearish reversal may need to sweep older external liquidity.
+
+            if bearSetupActive and not bearConfirmed
+                bearSetupActive := false
+                lastBearInvalidEventTime := bTime
+
+    // ---------------------------------------------------------------------------------------------
+    // Admit newly confirmed liquidity swings only after raid processing
+    // ---------------------------------------------------------------------------------------------
+    if newLiquidityHigh
+        float candidate = bHigh[1]
+        int candidateBar = bIdx - 1
+        int candidateTime = bTime[1]
+        float protectedLow = lastLiquidityLow
+
+        registerHigh(highPrices, highBars, highTimes, highProtectedLows,
+             candidate, candidateBar, candidateTime, protectedLow, equalityTolerance, maxLevels)
+
+        lastLiquidityHigh := candidate
+
+    if newLiquidityLow
+        float candidate = bLow[1]
+        int candidateBar = bIdx - 1
+        int candidateTime = bTime[1]
+        float protectedHigh = lastLiquidityHigh
+
+        registerLow(lowPrices, lowBars, lowTimes, lowProtectedHighs,
+             candidate, candidateBar, candidateTime, protectedHigh, equalityTolerance, maxLevels)
+
+        lastLiquidityLow := candidate
+
+    programLow := na(programLow) ? bLow : math.min(programLow, bLow)
+    programHigh := na(programHigh) ? bHigh : math.max(programHigh, bHigh)
+
+    [activeHigh, activeHighTime] = outerHigh(highPrices, highTimes)
+    [activeLow, activeLowTime] = outerLow(lowPrices, lowTimes)
+
+    // Raw outputs. The confirmed-bar offset for lower charts is applied by anchorGated().
+    [lastBullEventSwing,
+     lastBullEventSwingTime,
+     lastBullEventWick,
+     lastBullEventWickTime,
+     lastBullSFPTime,
+     lastBullEventST,
+     lastBullEventSTOriginTime,
+     lastBullEventIT,
+     lastBullEventITOriginTime,
+     lastBearEventSwing,
+     lastBearEventSwingTime,
+     lastBearEventWick,
+     lastBearEventWickTime,
+     lastBearSFPTime,
+     lastBearEventST,
+     lastBearEventSTOriginTime,
+     lastBearEventIT,
+     lastBearEventITOriginTime,
+     lastBullSTEventTime,
+     lastBearSTEventTime,
+     lastBullITEventTime,
+     lastBearITEventTime,
+     lastBullInvalidEventTime,
+     lastBearInvalidEventTime,
+     program,
+     activeHigh,
+     activeHighTime,
+     activeLow,
+     activeLowTime,
+     bClose]
+
+// -------------------------------------------------------------------------------------------------
+// CME-hours gate and confirmed-bar projection
+//
+// With "CME hours only" on, the engine is called on CME-hours bars only. Every history read, bar
+// count and swing inside it then sees a stream with no weekend or break bars, as if they did not
+// exist. With it off, barOpen is always true and the engine runs on every bar exactly as before.
+//
+// Outputs are held here between calls, and the confirmed-bar [1] offset for lower charts is applied
+// to the held values on every 15m bar. It cannot live inside the engine: in a conditionally called
+// function [1] means the previous call, which would hide a signal completed on the last bar before
+// a closure until the next open.
+// -------------------------------------------------------------------------------------------------
+anchorGated() =>
+    bool barOpen = not cmeOnly or f_cmeClock(time)
+
+    var float gBullSwing = na
+    var int gBullSwingTime = na
+    var float gBullWick = na
+    var int gBullWickTime = na
+    var int gBullFireTime = na
+    var float gBullST = na
+    var int gBullSTOriginTime = na
+    var float gBullIT = na
+    var int gBullITOriginTime = na
+    var float gBearSwing = na
+    var int gBearSwingTime = na
+    var float gBearWick = na
+    var int gBearWickTime = na
+    var int gBearFireTime = na
+    var float gBearST = na
+    var int gBearSTOriginTime = na
+    var float gBearIT = na
+    var int gBearITOriginTime = na
+    var int gBullSTEventTime = na
+    var int gBearSTEventTime = na
+    var int gBullITEventTime = na
+    var int gBearITEventTime = na
+    var int gBullInvalidTime = na
+    var int gBearInvalidTime = na
+    var int gProgram = 0
+    var float gActiveHigh = na
+    var int gActiveHighTime = na
+    var float gActiveLow = na
+    var int gActiveLowTime = na
+    var float gAnchorClose = na
+
+    if barOpen
+        [eBullSwing, eBullSwingTime, eBullWick, eBullWickTime, eBullFireTime, eBullST, eBullSTOriginTime, eBullIT, eBullITOriginTime, eBearSwing, eBearSwingTime, eBearWick, eBearWickTime, eBearFireTime, eBearST, eBearSTOriginTime, eBearIT, eBearITOriginTime, eBullSTEventTime, eBearSTEventTime, eBullITEventTime, eBearITEventTime, eBullInvalidTime, eBearInvalidTime, eProgram, eActiveHigh, eActiveHighTime, eActiveLow, eActiveLowTime, eAnchorClose] = anchorEngine(open, high, low, close, time)
+        gBullSwing := eBullSwing
+        gBullSwingTime := eBullSwingTime
+        gBullWick := eBullWick
+        gBullWickTime := eBullWickTime
+        gBullFireTime := eBullFireTime
+        gBullST := eBullST
+        gBullSTOriginTime := eBullSTOriginTime
+        gBullIT := eBullIT
+        gBullITOriginTime := eBullITOriginTime
+        gBearSwing := eBearSwing
+        gBearSwingTime := eBearSwingTime
+        gBearWick := eBearWick
+        gBearWickTime := eBearWickTime
+        gBearFireTime := eBearFireTime
+        gBearST := eBearST
+        gBearSTOriginTime := eBearSTOriginTime
+        gBearIT := eBearIT
+        gBearITOriginTime := eBearITOriginTime
+        gBullSTEventTime := eBullSTEventTime
+        gBearSTEventTime := eBearSTEventTime
+        gBullITEventTime := eBullITEventTime
+        gBearITEventTime := eBearITEventTime
+        gBullInvalidTime := eBullInvalidTime
+        gBearInvalidTime := eBearInvalidTime
+        gProgram := eProgram
+        gActiveHigh := eActiveHigh
+        gActiveHighTime := eActiveHighTime
+        gActiveLow := eActiveLow
+        gActiveLowTime := eActiveLowTime
+        gAnchorClose := eAnchorClose
+
+    bool requestedContextIsHTF = timeframe.in_seconds(timeframe.main_period) < timeframe.in_seconds()
+
+    [requestedContextIsHTF ? gBullSwing[1] : gBullSwing,
+     requestedContextIsHTF ? gBullSwingTime[1] : gBullSwingTime,
+     requestedContextIsHTF ? gBullWick[1] : gBullWick,
+     requestedContextIsHTF ? gBullWickTime[1] : gBullWickTime,
+     requestedContextIsHTF ? gBullFireTime[1] : gBullFireTime,
+     requestedContextIsHTF ? gBullST[1] : gBullST,
+     requestedContextIsHTF ? gBullSTOriginTime[1] : gBullSTOriginTime,
+     requestedContextIsHTF ? gBullIT[1] : gBullIT,
+     requestedContextIsHTF ? gBullITOriginTime[1] : gBullITOriginTime,
+     requestedContextIsHTF ? gBearSwing[1] : gBearSwing,
+     requestedContextIsHTF ? gBearSwingTime[1] : gBearSwingTime,
+     requestedContextIsHTF ? gBearWick[1] : gBearWick,
+     requestedContextIsHTF ? gBearWickTime[1] : gBearWickTime,
+     requestedContextIsHTF ? gBearFireTime[1] : gBearFireTime,
+     requestedContextIsHTF ? gBearST[1] : gBearST,
+     requestedContextIsHTF ? gBearSTOriginTime[1] : gBearSTOriginTime,
+     requestedContextIsHTF ? gBearIT[1] : gBearIT,
+     requestedContextIsHTF ? gBearITOriginTime[1] : gBearITOriginTime,
+     requestedContextIsHTF ? gBullSTEventTime[1] : gBullSTEventTime,
+     requestedContextIsHTF ? gBearSTEventTime[1] : gBearSTEventTime,
+     requestedContextIsHTF ? gBullITEventTime[1] : gBullITEventTime,
+     requestedContextIsHTF ? gBearITEventTime[1] : gBearITEventTime,
+     requestedContextIsHTF ? gBullInvalidTime[1] : gBullInvalidTime,
+     requestedContextIsHTF ? gBearInvalidTime[1] : gBearInvalidTime,
+     requestedContextIsHTF ? gProgram[1] : gProgram,
+     requestedContextIsHTF ? gActiveHigh[1] : gActiveHigh,
+     requestedContextIsHTF ? gActiveHighTime[1] : gActiveHighTime,
+     requestedContextIsHTF ? gActiveLow[1] : gActiveLow,
+     requestedContextIsHTF ? gActiveLowTime[1] : gActiveLowTime,
+     requestedContextIsHTF ? gAnchorClose[1] : gAnchorClose]
+
+// -------------------------------------------------------------------------------------------------
+// Fixed 15m engine routing
+//
+// 15m chart:
+//   Run the engine directly. No request.security() layer.
+//
+// Lower execution chart:
+//   Request the confirmed 15m engine once. anchorGated() returns [1]-shifted held
+//   state because the requested 15m context is higher than the main chart.
+//
+// Chart above 15m:
+//   Unsupported. Do not request a lower timeframe; drawings and alerts are suppressed.
+// -------------------------------------------------------------------------------------------------
+float aBullSwing = na
+int aBullSwingTime = na
+float aBullWick = na
+int aBullWickTime = na
+int aBullFireTime = na
+float aBullST = na
+int aBullSTOriginTime = na
+float aBullIT = na
+int aBullITOriginTime = na
+float aBearSwing = na
+int aBearSwingTime = na
+float aBearWick = na
+int aBearWickTime = na
+int aBearFireTime = na
+float aBearST = na
+int aBearSTOriginTime = na
+float aBearIT = na
+int aBearITOriginTime = na
+int aBullSTEventTime = na
+int aBearSTEventTime = na
+int aBullITEventTime = na
+int aBearITEventTime = na
+int aBullInvalidTime = na
+int aBearInvalidTime = na
+int aProgram = na
+float aActiveHigh = na
+int aActiveHighTime = na
+float aActiveLow = na
+int aActiveLowTime = na
+float aAnchorClose = na
+
+if chartEquals15m
+    [dBullSwing, dBullSwingTime, dBullWick, dBullWickTime, dBullFireTime, dBullST, dBullSTOriginTime, dBullIT, dBullITOriginTime, dBearSwing, dBearSwingTime, dBearWick, dBearWickTime, dBearFireTime, dBearST, dBearSTOriginTime, dBearIT, dBearITOriginTime, dBullSTEventTime, dBearSTEventTime, dBullITEventTime, dBearITEventTime, dBullInvalidTime, dBearInvalidTime, dProgram, dActiveHigh, dActiveHighTime, dActiveLow, dActiveLowTime, dAnchorClose] = anchorGated()
+    aBullSwing := dBullSwing
+    aBullSwingTime := dBullSwingTime
+    aBullWick := dBullWick
+    aBullWickTime := dBullWickTime
+    aBullFireTime := dBullFireTime
+    aBullST := dBullST
+    aBullSTOriginTime := dBullSTOriginTime
+    aBullIT := dBullIT
+    aBullITOriginTime := dBullITOriginTime
+    aBearSwing := dBearSwing
+    aBearSwingTime := dBearSwingTime
+    aBearWick := dBearWick
+    aBearWickTime := dBearWickTime
+    aBearFireTime := dBearFireTime
+    aBearST := dBearST
+    aBearSTOriginTime := dBearSTOriginTime
+    aBearIT := dBearIT
+    aBearITOriginTime := dBearITOriginTime
+    aBullSTEventTime := dBullSTEventTime
+    aBearSTEventTime := dBearSTEventTime
+    aBullITEventTime := dBullITEventTime
+    aBearITEventTime := dBearITEventTime
+    aBullInvalidTime := dBullInvalidTime
+    aBearInvalidTime := dBearInvalidTime
+    aProgram := dProgram
+    aActiveHigh := dActiveHigh
+    aActiveHighTime := dActiveHighTime
+    aActiveLow := dActiveLow
+    aActiveLowTime := dActiveLowTime
+    aAnchorClose := dAnchorClose
+else if chartBelow15m
+    [rBullSwing, rBullSwingTime, rBullWick, rBullWickTime, rBullFireTime, rBullST, rBullSTOriginTime, rBullIT, rBullITOriginTime, rBearSwing, rBearSwingTime, rBearWick, rBearWickTime, rBearFireTime, rBearST, rBearSTOriginTime, rBearIT, rBearITOriginTime, rBullSTEventTime, rBearSTEventTime, rBullITEventTime, rBearITEventTime, rBullInvalidTime, rBearInvalidTime, rProgram, rActiveHigh, rActiveHighTime, rActiveLow, rActiveLowTime, rAnchorClose] = request.security(syminfo.tickerid, SFP_TF, anchorGated(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+    aBullSwing := rBullSwing
+    aBullSwingTime := rBullSwingTime
+    aBullWick := rBullWick
+    aBullWickTime := rBullWickTime
+    aBullFireTime := rBullFireTime
+    aBullST := rBullST
+    aBullSTOriginTime := rBullSTOriginTime
+    aBullIT := rBullIT
+    aBullITOriginTime := rBullITOriginTime
+    aBearSwing := rBearSwing
+    aBearSwingTime := rBearSwingTime
+    aBearWick := rBearWick
+    aBearWickTime := rBearWickTime
+    aBearFireTime := rBearFireTime
+    aBearST := rBearST
+    aBearSTOriginTime := rBearSTOriginTime
+    aBearIT := rBearIT
+    aBearITOriginTime := rBearITOriginTime
+    aBullSTEventTime := rBullSTEventTime
+    aBearSTEventTime := rBearSTEventTime
+    aBullITEventTime := rBullITEventTime
+    aBearITEventTime := rBearITEventTime
+    aBullInvalidTime := rBullInvalidTime
+    aBearInvalidTime := rBearInvalidTime
+    aProgram := rProgram
+    aActiveHigh := rActiveHigh
+    aActiveHighTime := rActiveHighTime
+    aActiveLow := rActiveLow
+    aActiveLowTime := rActiveLowTime
+    aAnchorClose := rAnchorClose
+
+// Persistent timestamps survive MTF bar merging. A new event exists only when a timestamp changes.
+timestampChanged(int eventTime) =>
+    not na(eventTime) and (na(eventTime[1]) or eventTime != eventTime[1])
+
+bullSFPEvent = not chartAbove15m and timestampChanged(aBullFireTime)
+bearSFPEvent = not chartAbove15m and timestampChanged(aBearFireTime)
+
+bullSTEvent = not chartAbove15m and timestampChanged(aBullSTEventTime)
+bearSTEvent = not chartAbove15m and timestampChanged(aBearSTEventTime)
+
+bullITEvent = not chartAbove15m and timestampChanged(aBullITEventTime)
+bearITEvent = not chartAbove15m and timestampChanged(aBearITEventTime)
+
+bullInvalidEvent = not chartAbove15m and timestampChanged(aBullInvalidTime)
+bearInvalidEvent = not chartAbove15m and timestampChanged(aBearInvalidTime)
+
+// -------------------------------------------------------------------------------------------------
+// Visual helpers
+// -------------------------------------------------------------------------------------------------
+var array<VisualSetup> history = array.new<VisualSetup>()
+var VisualSetup bullVisual = VisualSetup.new()
+var VisualSetup bearVisual = VisualSetup.new()
+
+deleteVisual(VisualSetup s) =>
+    if not na(s.liquidityLine)
+        line.delete(s.liquidityLine)
+    if not na(s.wickLine)
+        line.delete(s.wickLine)
+    if not na(s.stLine)
+        line.delete(s.stLine)
+    if not na(s.itLine)
+        line.delete(s.itLine)
+    if not na(s.sfpLabel)
+        label.delete(s.sfpLabel)
+    if not na(s.stLabel)
+        label.delete(s.stLabel)
+    if not na(s.itLabel)
+        label.delete(s.itLabel)
+    if not na(s.sweepBox)
+        box.delete(s.sweepBox)
+
+storeHistory(VisualSetup s) =>
+    array.push(history, s)
+
+    while array.size(history) > historyLimit
+        deleteVisual(array.shift(history))
+
+    true
+
+confirmVisual(VisualSetup s, color mainColor, color wickColor, int endTime) =>
+    if not na(s.liquidityLine)
+        line.set_extend(s.liquidityLine, extend.none)
+        line.set_x2(s.liquidityLine, endTime)
+        line.set_color(s.liquidityLine, mainColor)
+
+    if not na(s.wickLine)
+        line.set_color(s.wickLine, wickColor)
+
+    if not na(s.stLine)
+        line.set_extend(s.stLine, extend.none)
+        line.set_color(s.stLine, mainColor)
+
+    if not na(s.itLine)
+        line.set_extend(s.itLine, extend.none)
+        line.set_x2(s.itLine, endTime)
+        line.set_color(s.itLine, mainColor)
+        line.set_width(s.itLine, 2)
+
+    if not na(s.sfpLabel)
+        label.set_textcolor(s.sfpLabel, mainColor)
+
+    if not na(s.stLabel)
+        label.set_textcolor(s.stLabel, mainColor)
+
+    if not na(s.itLabel)
+        label.set_textcolor(s.itLabel, mainColor)
+
+    if not na(s.sweepBox)
+        int rightTime = math.max(endTime, zoneMinRight(s.wickTime))
+        box.set_right(s.sweepBox, rightTime)
+        box.set_bgcolor(s.sweepBox, color.new(mainColor, 88))
+
+    s.active := false
+    s.confirmed := true
+    storeHistory(s)
+    true
+
+invalidateVisual(VisualSetup s, int endTime) =>
+    if s.stReached and not removeInvalidated
+        color lineColor = color.new(color.gray, 72)
+        color wickColor = color.new(color.gray, 58)
+        color textColor = color.new(color.gray, 30)
+
+        if not na(s.liquidityLine)
+            line.set_extend(s.liquidityLine, extend.none)
+            line.set_x2(s.liquidityLine, endTime)
+            line.set_color(s.liquidityLine, lineColor)
+
+        if not na(s.wickLine)
+            line.set_color(s.wickLine, wickColor)
+
+        if not na(s.stLine)
+            line.set_extend(s.stLine, extend.none)
+            line.set_x2(s.stLine, endTime)
+            line.set_color(s.stLine, lineColor)
+            line.set_width(s.stLine, 1)
+
+        if not na(s.itLine)
+            line.set_extend(s.itLine, extend.none)
+            line.set_x2(s.itLine, endTime)
+            line.set_color(s.itLine, color.new(color.gray, 84))
+            line.set_width(s.itLine, 1)
+
+        if not na(s.sfpLabel)
+            label.set_text(s.sfpLabel, "SFP ×")
+            label.set_textcolor(s.sfpLabel, textColor)
+
+        if not na(s.stLabel)
+            label.set_text(s.stLabel, "ST MSS ×")
+            label.set_textcolor(s.stLabel, textColor)
+
+        if not na(s.sweepBox)
+            box.set_right(s.sweepBox, endTime)
+            box.set_bgcolor(s.sweepBox, color.new(color.gray, 95))
+            box.set_border_color(s.sweepBox, color.new(color.gray, 90))
+
+        s.active := false
+        storeHistory(s)
+    else
+        deleteVisual(s)
+
+    true
+
+developingBear = fadeDeveloping ? color.new(bearColor, 65) : bearColor
+developingBull = fadeDeveloping ? color.new(bullColor, 65) : bullColor
+developingBearWick = fadeDeveloping ? color.new(bearWickColor, 82) : bearWickColor
+developingBullWick = fadeDeveloping ? color.new(bullWickColor, 82) : bullWickColor
+developingBoxOpacity = fadeDeveloping ? 94 : 88
+
+makeBearVisual() =>
+    VisualSetup s = VisualSetup.new()
+
+    s.direction := -1
+    s.swingTime := aBearSwingTime
+    s.swingPrice := aBearSwing
+    s.wickTime := aBearWickTime
+    s.wickPrice := aBearWick
+    s.fireTime := aBearFireTime
+    s.stPrice := aBearST
+    s.stOriginTime := aBearSTOriginTime
+    s.itPrice := aBearIT
+    s.itOriginTime := aBearITOriginTime
+    s.active := true
+    s.stReached := false
+    s.confirmed := false
+
+    if showSweepZone
+        int rightTime = math.max(aBearFireTime, zoneMinRight(aBearWickTime))
+        s.sweepBox := box.new(aBearWickTime, aBearWick, rightTime, aBearSwing,
+             xloc=xloc.bar_time, border_color=transparent, bgcolor=color.new(bearColor, developingBoxOpacity))
+
+    if showLiquidityLine
+        s.liquidityLine := line.new(aBearSwingTime, aBearSwing, aBearFireTime, aBearSwing,
+             xloc=xloc.bar_time, extend=extend.right, color=developingBear)
+
+    if showSweepWick
+        s.wickLine := line.new(aBearWickTime, aBearWick, aBearWickTime, aBearSwing,
+             xloc=xloc.bar_time, color=developingBearWick, width=3)
+
+    if showSFPLabel
+        s.sfpLabel := label.new(aBearWickTime, aBearWick, "SFP",
+             xloc=xloc.bar_time, style=label.style_label_down,
+             textcolor=developingBear, color=transparent, size=size.normal)
+
+    if showSTMSS and not na(aBearST) and not na(aBearSTOriginTime)
+        s.stLine := line.new(aBearSTOriginTime, aBearST, aBearFireTime, aBearST,
+             xloc=xloc.bar_time, extend=extend.right,
+             color=color.new(bearColor, 45), style=line.style_dashed)
+
+    if showITMSS and not na(aBearIT) and not na(aBearITOriginTime)
+        s.itLine := line.new(aBearITOriginTime, aBearIT, aBearFireTime, aBearIT,
+             xloc=xloc.bar_time, extend=extend.right,
+             color=color.new(bearColor, 60), style=line.style_dotted)
+
+    s
+
+makeBullVisual() =>
+    VisualSetup s = VisualSetup.new()
+
+    s.direction := 1
+    s.swingTime := aBullSwingTime
+    s.swingPrice := aBullSwing
+    s.wickTime := aBullWickTime
+    s.wickPrice := aBullWick
+    s.fireTime := aBullFireTime
+    s.stPrice := aBullST
+    s.stOriginTime := aBullSTOriginTime
+    s.itPrice := aBullIT
+    s.itOriginTime := aBullITOriginTime
+    s.active := true
+    s.stReached := false
+    s.confirmed := false
+
+    if showSweepZone
+        int rightTime = math.max(aBullFireTime, zoneMinRight(aBullWickTime))
+        s.sweepBox := box.new(aBullWickTime, aBullSwing, rightTime, aBullWick,
+             xloc=xloc.bar_time, border_color=transparent, bgcolor=color.new(bullColor, developingBoxOpacity))
+
+    if showLiquidityLine
+        s.liquidityLine := line.new(aBullSwingTime, aBullSwing, aBullFireTime, aBullSwing,
+             xloc=xloc.bar_time, extend=extend.right, color=developingBull)
+
+    if showSweepWick
+        s.wickLine := line.new(aBullWickTime, aBullWick, aBullWickTime, aBullSwing,
+             xloc=xloc.bar_time, color=developingBullWick, width=3)
+
+    if showSFPLabel
+        s.sfpLabel := label.new(aBullWickTime, aBullWick, "SFP",
+             xloc=xloc.bar_time, style=label.style_label_up,
+             textcolor=developingBull, color=transparent, size=size.normal)
+
+    if showSTMSS and not na(aBullST) and not na(aBullSTOriginTime)
+        s.stLine := line.new(aBullSTOriginTime, aBullST, aBullFireTime, aBullST,
+             xloc=xloc.bar_time, extend=extend.right,
+             color=color.new(bullColor, 45), style=line.style_dashed)
+
+    if showITMSS and not na(aBullIT) and not na(aBullITOriginTime)
+        s.itLine := line.new(aBullITOriginTime, aBullIT, aBullFireTime, aBullIT,
+             xloc=xloc.bar_time, extend=extend.right,
+             color=color.new(bullColor, 60), style=line.style_dotted)
+
+    s
+
+// -------------------------------------------------------------------------------------------------
+// Visual event processing
+// -------------------------------------------------------------------------------------------------
+if bearInvalidEvent and bearVisual.active and not bearVisual.confirmed
+    invalidateVisual(bearVisual, aBearInvalidTime)
+    bearVisual := VisualSetup.new()
+
+if bullInvalidEvent and bullVisual.active and not bullVisual.confirmed
+    invalidateVisual(bullVisual, aBullInvalidTime)
+    bullVisual := VisualSetup.new()
+
+if bearSFPEvent
+    if bearVisual.active and not bearVisual.confirmed
+        deleteVisual(bearVisual)
+
+    bearVisual := makeBearVisual()
+
+if bullSFPEvent
+    if bullVisual.active and not bullVisual.confirmed
+        deleteVisual(bullVisual)
+
+    bullVisual := makeBullVisual()
+
+if bearSTEvent and bearVisual.active and not bearVisual.stReached
+    bearVisual.stReached := true
+
+    if not na(bearVisual.stLine)
+        line.set_extend(bearVisual.stLine, extend.none)
+        line.set_x2(bearVisual.stLine, aBearSTEventTime)
+        line.set_color(bearVisual.stLine, bearColor)
+
+    if showSTMSS
+        bearVisual.stLabel := label.new(aBearSTEventTime, bearVisual.stPrice, "ST MSS",
+             xloc=xloc.bar_time, style=label.style_label_down,
+             textcolor=bearColor, color=transparent, size=size.small)
+
+    if not na(bearVisual.sfpLabel)
+        label.set_textcolor(bearVisual.sfpLabel, bearColor)
+
+if bullSTEvent and bullVisual.active and not bullVisual.stReached
+    bullVisual.stReached := true
+
+    if not na(bullVisual.stLine)
+        line.set_extend(bullVisual.stLine, extend.none)
+        line.set_x2(bullVisual.stLine, aBullSTEventTime)
+        line.set_color(bullVisual.stLine, bullColor)
+
+    if showSTMSS
+        bullVisual.stLabel := label.new(aBullSTEventTime, bullVisual.stPrice, "ST MSS",
+             xloc=xloc.bar_time, style=label.style_label_up,
+             textcolor=bullColor, color=transparent, size=size.small)
+
+    if not na(bullVisual.sfpLabel)
+        label.set_textcolor(bullVisual.sfpLabel, bullColor)
+
+if bearITEvent and bearVisual.active
+    if not na(bearVisual.itLine)
+        line.set_extend(bearVisual.itLine, extend.none)
+        line.set_x2(bearVisual.itLine, aBearITEventTime)
+        line.set_color(bearVisual.itLine, bearColor)
+        line.set_width(bearVisual.itLine, 2)
+
+    if showITMSS
+        bearVisual.itLabel := label.new(aBearITEventTime, bearVisual.itPrice, "IT MSS · SELL",
+             xloc=xloc.bar_time, style=label.style_label_down,
+             textcolor=bearColor, color=transparent, size=size.small)
+
+    confirmVisual(bearVisual, bearColor, bearWickColor, aBearITEventTime)
+    bearVisual := VisualSetup.new()
+
+if bullITEvent and bullVisual.active
+    if not na(bullVisual.itLine)
+        line.set_extend(bullVisual.itLine, extend.none)
+        line.set_x2(bullVisual.itLine, aBullITEventTime)
+        line.set_color(bullVisual.itLine, bullColor)
+        line.set_width(bullVisual.itLine, 2)
+
+    if showITMSS
+        bullVisual.itLabel := label.new(aBullITEventTime, bullVisual.itPrice, "IT MSS · BUY",
+             xloc=xloc.bar_time, style=label.style_label_up,
+             textcolor=bullColor, color=transparent, size=size.small)
+
+    confirmVisual(bullVisual, bullColor, bullWickColor, aBullITEventTime)
+    bullVisual := VisualSetup.new()
+
+// -------------------------------------------------------------------------------------------------
+// Diagnostics
+// -------------------------------------------------------------------------------------------------
+var line highDiagnostic = na
+var line lowDiagnostic = na
+
+statePosition = switch statePositionChoice
+    "Top Left" => position.top_left
+    "Top Right" => position.top_right
+    "Bottom Left" => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    "Bottom Right" => position.bottom_right
+    => position.top_center
+
+var table stateTable = table.new(statePosition, 1, 1)
+
+if barstate.islast
+    if not na(highDiagnostic)
+        line.delete(highDiagnostic)
+
+    if not na(lowDiagnostic)
+        line.delete(lowDiagnostic)
+
+    highDiagnostic := na
+    lowDiagnostic := na
+
+    if showExtremes and not chartAbove15m
+        if not na(aActiveHigh) and not na(aActiveHighTime)
+            highDiagnostic := line.new(aActiveHighTime, aActiveHigh, time, aActiveHigh,
+                 xloc=xloc.bar_time, extend=extend.right,
+                 color=color.new(bearColor, 35), style=line.style_dotted)
+
+        if not na(aActiveLow) and not na(aActiveLowTime)
+            lowDiagnostic := line.new(aActiveLowTime, aActiveLow, time, aActiveLow,
+                 xloc=xloc.bar_time, extend=extend.right,
+                 color=color.new(bullColor, 35), style=line.style_dotted)
+
+    if chartAbove15m
+        table.cell(stateTable, 0, 0, "15m MODEL · Use 15m or lower",
+             text_color=color.white, bgcolor=color.new(color.orange, 5), text_size=size.small)
+    else if showMMXM
+        string stateText = aProgram == 1 ? "MMXM · BUY · 15m" :
+             aProgram == -1 ? "MMXM · SELL · 15m" :
+             "MMXM · UNKNOWN · 15m"
+
+        color stateColor = aProgram == 1 ? bullColor :
+             aProgram == -1 ? bearColor : color.gray
+
+        table.cell(stateTable, 0, 0, stateText,
+             text_color=color.white, bgcolor=color.new(stateColor, 10), text_size=size.small)
+    else
+        table.cell(stateTable, 0, 0, "", bgcolor=transparent)
+
+// -------------------------------------------------------------------------------------------------
+// Optional cleanup of already-confirmed historical setups
+// Uses the confirmed anchor close returned by the same one-pass anchor request.
+// -------------------------------------------------------------------------------------------------
+if not chartAbove15m and removeInvalidated and array.size(history) > 0
+    for i = array.size(history) - 1 to 0
+        VisualSetup s = array.get(history, i)
+
+        bool bearishSetup = s.direction == -1
+        bool invalid = (bearishSetup and aAnchorClose > s.wickPrice) or
+             (not bearishSetup and aAnchorClose < s.wickPrice)
+
+        if invalid
+            deleteVisual(s)
+            array.remove(history, i)
+
+// -------------------------------------------------------------------------------------------------
+// Alerts
+// Recreate TradingView alerts after replacing a previous script version.
+// -------------------------------------------------------------------------------------------------
+alertcondition(bullSFPEvent, "Bullish 15m SFP", "Bullish 15m Swing Failure Pattern on {{ticker}}.")
+alertcondition(bearSFPEvent, "Bearish 15m SFP", "Bearish 15m Swing Failure Pattern on {{ticker}}.")
+
+alertcondition(bullSTEvent, "Bullish 15m Short-Term MSS",
+     "Bullish 15m Short-Term MSS after SFP on {{ticker}}.")
+
+alertcondition(bearSTEvent, "Bearish 15m Short-Term MSS",
+     "Bearish 15m Short-Term MSS after SFP on {{ticker}}.")
+
+alertcondition(bullITEvent, "Bullish 15m Intermediate-Term MSS / BUY Program",
+     "15m Intermediate-Term MSS confirmed MMXM BUY program on {{ticker}}.")
+
+alertcondition(bearITEvent, "Bearish 15m Intermediate-Term MSS / SELL Program",
+     "15m Intermediate-Term MSS confirmed MMXM SELL program on {{ticker}}.")
