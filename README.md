@@ -1,4 +1,4 @@
-[README (4).md](https://github.com/user-attachments/files/33139834/README.4.md)
+[README (2).md](https://github.com/user-attachments/files/34303602/README.2.md)
 # Swing Failure Pattern
 
 A Pine Script v6 indicator for TradingView. It marks swing failure patterns at structural highs and lows on the 15-minute chart, then tracks whether price follows through with a short-term and an intermediate-term market structure shift. The intermediate-term shift is what flips the MMXM program between BUY and SELL.
@@ -53,6 +53,7 @@ The Pine compiler will warn that the engine should be called on each calculation
 
 | Mark | Meaning |
 |---|---|
+| `raid` | A standing level has been swept and the SFP is still forming. Disappears when the raid resolves |
 | `SFP` | Sweep and reclaim of a standing level |
 | `ST MSS` | Short-term structure broken after the SFP |
 | `IT MSS · BUY` / `IT MSS · SELL` | Program flipped |
@@ -94,6 +95,7 @@ Leave **Remove invalidated setups** off when you review performance. With it on,
 | Setting | Default | Notes |
 |---|---|---|
 | SFP liquidity line, Sweep wick, SFP label | On | |
+| Raid marker | On | Shows `raid` at the swept level while a raid is live. Removed when it resolves, so it never stays on the chart |
 | Short-Term MSS, Intermediate-Term MSS | On | |
 | Sweep zone box | Off | Shades from the swept level to the raid extreme |
 | Sweep zone minimum width (15m bars) | 8 | Only matters with the box on. Sets the width of a developing box. A confirmed box already runs out to its IT MSS, so on most setups this changes nothing |
@@ -103,12 +105,16 @@ Leave **Remove invalidated setups** off when you review performance. With it on,
 
 ## Alerts
 
+- Bullish 15m raid
+- Bearish 15m raid
 - Bullish 15m SFP
 - Bearish 15m SFP
 - Bullish 15m Short-Term MSS
 - Bearish 15m Short-Term MSS
 - Bullish 15m Intermediate-Term MSS / BUY Program
 - Bearish 15m Intermediate-Term MSS / SELL Program
+
+The raid alerts are the early warning. They fire at the close of the 15m candle that first sweeps a standing level, while the SFP is still forming, and the `raid` mark appears on the chart at the same moment. A 15m SFP needs a closed 15m candle to confirm, and with next-candle confirmation on, often two. On a fast reversal that can mean price is well off the low by the time the SFP alert arrives. The raid alert gets you onto the lower timeframe before that happens. On 64 trading days of NAS100 perp data it fired about 1.7 times a day, a little over half went on to an SFP, and every SFP was preceded by one, typically 30 minutes earlier. The other half are raids that turned into a breakout or timed out, so treat it as a reason to look, not a signal to trade.
 
 Set them to once per bar close. On a lower chart they fire from closed 15m data only. With CME hours on, none of them fire during closed hours. When you update the script, delete and recreate your alerts, because each alert stays bound to the version it was created on.
 
