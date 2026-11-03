@@ -24,6 +24,11 @@ indicator("Swing Failure Pattern", overlay=true, precision=2, max_labels_count=5
 // • Opposite-direction SFPs remain eligible as reversal candidates and are invalidated if trend continues.
 //
 // Detection logic and current 720 / 960-minute controls are unchanged from v5.
+//
+// Raid alert: fires at the close of the 15m candle on which standing liquidity is first swept,
+// if the raid is still live. Early warning only - it records an event, it changes no detection.
+// While the raid is live a small "raid" mark sits at the swept level; it is removed when the raid
+// resolves, into an SFP (which draws its own marks) or into a breakout or timeout.
 // =================================================================================================
 
 // -------------------------------------------------------------------------------------------------
@@ -94,6 +99,8 @@ G_STYLE = "Style"
 showLiquidityLine = input.bool(true, "SFP liquidity line", group=G_STYLE)
 showSweepWick     = input.bool(true, "Sweep wick", group=G_STYLE)
 showSFPLabel      = input.bool(true, "SFP label", group=G_STYLE)
+showRaidMarker    = input.bool(true, "Raid marker", group=G_STYLE,
+     tooltip="Marks the swept level with \"raid\" while a 15m raid is live and the SFP is still forming. Removed when the raid resolves, so it never stays on the chart.")
 showSTMSS         = input.bool(true, "Short-Term MSS", group=G_STYLE)
 showITMSS         = input.bool(true, "Intermediate-Term MSS", group=G_STYLE)
 showSweepZone     = input.bool(false, "Sweep zone box", group=G_STYLE)
@@ -538,6 +545,8 @@ anchorEngine(float bOpen, float bHigh, float bLow, float bClose, int bTime) =>
     var int lastBearITEventTime = na
     var int lastBullInvalidEventTime = na
     var int lastBearInvalidEventTime = na
+    var int lastBullRaidTime = na
+    var int lastBearRaidTime = na
 
     // ---------------------------------------------------------------------------------------------
     // Invalidation / expiry
@@ -813,6 +822,16 @@ anchorEngine(float bOpen, float bHigh, float bLow, float bClose, int bTime) =>
                 lastBearInvalidEventTime := bTime
 
     // ---------------------------------------------------------------------------------------------
+    // Raid alert. A raid that started on this bar and is still live at its close: standing
+    // liquidity has been swept and an SFP may follow. Recorded only - no detection reads it.
+    // ---------------------------------------------------------------------------------------------
+    if bearRaid and bearRaidStart == bIdx
+        lastBearRaidTime := bTime
+
+    if bullRaid and bullRaidStart == bIdx
+        lastBullRaidTime := bTime
+
+    // ---------------------------------------------------------------------------------------------
     // Admit newly confirmed liquidity swings only after raid processing
     // ---------------------------------------------------------------------------------------------
     if newLiquidityHigh
@@ -873,7 +892,11 @@ anchorEngine(float bOpen, float bHigh, float bLow, float bClose, int bTime) =>
      activeHighTime,
      activeLow,
      activeLowTime,
-     bClose]
+     bClose,
+     lastBullRaidTime,
+     lastBearRaidTime,
+     bullRaid ? bullLevel : na,
+     bearRaid ? bearLevel : na]
 
 // -------------------------------------------------------------------------------------------------
 // CME-hours gate and confirmed-bar projection
@@ -920,9 +943,13 @@ anchorGated() =>
     var float gActiveLow = na
     var int gActiveLowTime = na
     var float gAnchorClose = na
+    var int gBullRaidTime = na
+    var int gBearRaidTime = na
+    var float gBullRaidLevel = na
+    var float gBearRaidLevel = na
 
     if barOpen
-        [eBullSwing, eBullSwingTime, eBullWick, eBullWickTime, eBullFireTime, eBullST, eBullSTOriginTime, eBullIT, eBullITOriginTime, eBearSwing, eBearSwingTime, eBearWick, eBearWickTime, eBearFireTime, eBearST, eBearSTOriginTime, eBearIT, eBearITOriginTime, eBullSTEventTime, eBearSTEventTime, eBullITEventTime, eBearITEventTime, eBullInvalidTime, eBearInvalidTime, eProgram, eActiveHigh, eActiveHighTime, eActiveLow, eActiveLowTime, eAnchorClose] = anchorEngine(open, high, low, close, time)
+        [eBullSwing, eBullSwingTime, eBullWick, eBullWickTime, eBullFireTime, eBullST, eBullSTOriginTime, eBullIT, eBullITOriginTime, eBearSwing, eBearSwingTime, eBearWick, eBearWickTime, eBearFireTime, eBearST, eBearSTOriginTime, eBearIT, eBearITOriginTime, eBullSTEventTime, eBearSTEventTime, eBullITEventTime, eBearITEventTime, eBullInvalidTime, eBearInvalidTime, eProgram, eActiveHigh, eActiveHighTime, eActiveLow, eActiveLowTime, eAnchorClose, eBullRaidTime, eBearRaidTime, eBullRaidLevel, eBearRaidLevel] = anchorEngine(open, high, low, close, time)
         gBullSwing := eBullSwing
         gBullSwingTime := eBullSwingTime
         gBullWick := eBullWick
@@ -953,6 +980,10 @@ anchorGated() =>
         gActiveLow := eActiveLow
         gActiveLowTime := eActiveLowTime
         gAnchorClose := eAnchorClose
+        gBullRaidTime := eBullRaidTime
+        gBearRaidTime := eBearRaidTime
+        gBullRaidLevel := eBullRaidLevel
+        gBearRaidLevel := eBearRaidLevel
 
     bool requestedContextIsHTF = timeframe.in_seconds(timeframe.main_period) < timeframe.in_seconds()
 
@@ -985,7 +1016,11 @@ anchorGated() =>
      requestedContextIsHTF ? gActiveHighTime[1] : gActiveHighTime,
      requestedContextIsHTF ? gActiveLow[1] : gActiveLow,
      requestedContextIsHTF ? gActiveLowTime[1] : gActiveLowTime,
-     requestedContextIsHTF ? gAnchorClose[1] : gAnchorClose]
+     requestedContextIsHTF ? gAnchorClose[1] : gAnchorClose,
+     requestedContextIsHTF ? gBullRaidTime[1] : gBullRaidTime,
+     requestedContextIsHTF ? gBearRaidTime[1] : gBearRaidTime,
+     requestedContextIsHTF ? gBullRaidLevel[1] : gBullRaidLevel,
+     requestedContextIsHTF ? gBearRaidLevel[1] : gBearRaidLevel]
 
 // -------------------------------------------------------------------------------------------------
 // Fixed 15m engine routing
@@ -1030,9 +1065,13 @@ int aActiveHighTime = na
 float aActiveLow = na
 int aActiveLowTime = na
 float aAnchorClose = na
+int aBullRaidTime = na
+int aBearRaidTime = na
+float aBullRaidLevel = na
+float aBearRaidLevel = na
 
 if chartEquals15m
-    [dBullSwing, dBullSwingTime, dBullWick, dBullWickTime, dBullFireTime, dBullST, dBullSTOriginTime, dBullIT, dBullITOriginTime, dBearSwing, dBearSwingTime, dBearWick, dBearWickTime, dBearFireTime, dBearST, dBearSTOriginTime, dBearIT, dBearITOriginTime, dBullSTEventTime, dBearSTEventTime, dBullITEventTime, dBearITEventTime, dBullInvalidTime, dBearInvalidTime, dProgram, dActiveHigh, dActiveHighTime, dActiveLow, dActiveLowTime, dAnchorClose] = anchorGated()
+    [dBullSwing, dBullSwingTime, dBullWick, dBullWickTime, dBullFireTime, dBullST, dBullSTOriginTime, dBullIT, dBullITOriginTime, dBearSwing, dBearSwingTime, dBearWick, dBearWickTime, dBearFireTime, dBearST, dBearSTOriginTime, dBearIT, dBearITOriginTime, dBullSTEventTime, dBearSTEventTime, dBullITEventTime, dBearITEventTime, dBullInvalidTime, dBearInvalidTime, dProgram, dActiveHigh, dActiveHighTime, dActiveLow, dActiveLowTime, dAnchorClose, dBullRaidTime, dBearRaidTime, dBullRaidLevel, dBearRaidLevel] = anchorGated()
     aBullSwing := dBullSwing
     aBullSwingTime := dBullSwingTime
     aBullWick := dBullWick
@@ -1063,8 +1102,12 @@ if chartEquals15m
     aActiveLow := dActiveLow
     aActiveLowTime := dActiveLowTime
     aAnchorClose := dAnchorClose
+    aBullRaidTime := dBullRaidTime
+    aBearRaidTime := dBearRaidTime
+    aBullRaidLevel := dBullRaidLevel
+    aBearRaidLevel := dBearRaidLevel
 else if chartBelow15m
-    [rBullSwing, rBullSwingTime, rBullWick, rBullWickTime, rBullFireTime, rBullST, rBullSTOriginTime, rBullIT, rBullITOriginTime, rBearSwing, rBearSwingTime, rBearWick, rBearWickTime, rBearFireTime, rBearST, rBearSTOriginTime, rBearIT, rBearITOriginTime, rBullSTEventTime, rBearSTEventTime, rBullITEventTime, rBearITEventTime, rBullInvalidTime, rBearInvalidTime, rProgram, rActiveHigh, rActiveHighTime, rActiveLow, rActiveLowTime, rAnchorClose] = request.security(syminfo.tickerid, SFP_TF, anchorGated(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+    [rBullSwing, rBullSwingTime, rBullWick, rBullWickTime, rBullFireTime, rBullST, rBullSTOriginTime, rBullIT, rBullITOriginTime, rBearSwing, rBearSwingTime, rBearWick, rBearWickTime, rBearFireTime, rBearST, rBearSTOriginTime, rBearIT, rBearITOriginTime, rBullSTEventTime, rBearSTEventTime, rBullITEventTime, rBearITEventTime, rBullInvalidTime, rBearInvalidTime, rProgram, rActiveHigh, rActiveHighTime, rActiveLow, rActiveLowTime, rAnchorClose, rBullRaidTime, rBearRaidTime, rBullRaidLevel, rBearRaidLevel] = request.security(syminfo.tickerid, SFP_TF, anchorGated(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
     aBullSwing := rBullSwing
     aBullSwingTime := rBullSwingTime
     aBullWick := rBullWick
@@ -1095,6 +1138,10 @@ else if chartBelow15m
     aActiveLow := rActiveLow
     aActiveLowTime := rActiveLowTime
     aAnchorClose := rAnchorClose
+    aBullRaidTime := rBullRaidTime
+    aBearRaidTime := rBearRaidTime
+    aBullRaidLevel := rBullRaidLevel
+    aBearRaidLevel := rBearRaidLevel
 
 // Persistent timestamps survive MTF bar merging. A new event exists only when a timestamp changes.
 timestampChanged(int eventTime) =>
@@ -1111,6 +1158,9 @@ bearITEvent = not chartAbove15m and timestampChanged(aBearITEventTime)
 
 bullInvalidEvent = not chartAbove15m and timestampChanged(aBullInvalidTime)
 bearInvalidEvent = not chartAbove15m and timestampChanged(aBearInvalidTime)
+
+bullRaidEvent = not chartAbove15m and timestampChanged(aBullRaidTime)
+bearRaidEvent = not chartAbove15m and timestampChanged(aBearRaidTime)
 
 // -------------------------------------------------------------------------------------------------
 // Visual helpers
@@ -1415,6 +1465,37 @@ if bullITEvent and bullVisual.active
     bullVisual := VisualSetup.new()
 
 // -------------------------------------------------------------------------------------------------
+// Raid marker
+//
+// Shown only while a 15m raid is live: standing liquidity has been swept and the SFP is still
+// forming. Sits at the swept level on the raid candle and follows the level if the raid deepens.
+// Removed as soon as the raid resolves - into an SFP, which draws its own marks, or into a
+// breakout or timeout - so it never stays on the chart.
+// -------------------------------------------------------------------------------------------------
+var label bullRaidLabel = na
+var label bearRaidLabel = na
+
+if not na(bullRaidLabel) and (na(aBullRaidLevel) or bullRaidEvent)
+    label.delete(bullRaidLabel)
+    bullRaidLabel := na
+
+if showRaidMarker and bullRaidEvent and not na(aBullRaidLevel)
+    bullRaidLabel := label.new(aBullRaidTime, aBullRaidLevel, "raid", xloc=xloc.bar_time,
+         style=label.style_label_up, textcolor=developingBull, color=transparent, size=size.small)
+else if not na(bullRaidLabel) and label.get_y(bullRaidLabel) != aBullRaidLevel
+    label.set_y(bullRaidLabel, aBullRaidLevel)
+
+if not na(bearRaidLabel) and (na(aBearRaidLevel) or bearRaidEvent)
+    label.delete(bearRaidLabel)
+    bearRaidLabel := na
+
+if showRaidMarker and bearRaidEvent and not na(aBearRaidLevel)
+    bearRaidLabel := label.new(aBearRaidTime, aBearRaidLevel, "raid", xloc=xloc.bar_time,
+         style=label.style_label_down, textcolor=developingBear, color=transparent, size=size.small)
+else if not na(bearRaidLabel) and label.get_y(bearRaidLabel) != aBearRaidLevel
+    label.set_y(bearRaidLabel, aBearRaidLevel)
+
+// -------------------------------------------------------------------------------------------------
 // Diagnostics
 // -------------------------------------------------------------------------------------------------
 var line highDiagnostic = na
@@ -1487,6 +1568,12 @@ if not chartAbove15m and removeInvalidated and array.size(history) > 0
 // Alerts
 // Recreate TradingView alerts after replacing a previous script version.
 // -------------------------------------------------------------------------------------------------
+alertcondition(bullRaidEvent, "Bullish 15m raid",
+     "Bullish 15m raid on {{ticker}}: standing sell-side liquidity swept. A bullish SFP may follow, watch the lower timeframe for the reclaim.")
+
+alertcondition(bearRaidEvent, "Bearish 15m raid",
+     "Bearish 15m raid on {{ticker}}: standing buy-side liquidity swept. A bearish SFP may follow, watch the lower timeframe for the reclaim.")
+
 alertcondition(bullSFPEvent, "Bullish 15m SFP", "Bullish 15m Swing Failure Pattern on {{ticker}}.")
 alertcondition(bearSFPEvent, "Bearish 15m SFP", "Bearish 15m Swing Failure Pattern on {{ticker}}.")
 
